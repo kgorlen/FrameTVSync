@@ -1,0 +1,10 @@
+*cache*
+.venv/
+build/
+dist/
+*.egg-info
+.conda
+*.code-workspace
+tests/
+commit_msg.txt
+examples/

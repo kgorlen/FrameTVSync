@@ -1,0 +1,87 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        
+        {
+            "name": "samsungtv with Arguments",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "${workspaceFolder}/.venv/Scripts/samsungtv.exe --host 192.168.1.143 --token-file ${workspaceFolder}/.frametvsync.token --name frametvsync ${input:samsungtvArgs}"
+        },
+        {
+            "name": "Python Debugger: frametvsync",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --dry-run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["--dry-run", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --ip '192.168.1.143' --dry-run",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["--ip", "192.168.1.143", "--dry-run", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --dry-run --reset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["--dry-run", "--reset", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --ip '192.168.1.143' --reset",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["--ip", "192.168.1.143", "--reset", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --help",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["-h"]
+        },
+        {
+            "name": "Python Debugger: frametvsync --version",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": ["--version"]
+        },
+        {
+            "name": "Python Debugger: artmode.py",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "./src/frametvsync/artmode.py",
+            "console": "integratedTerminal",
+            "args": []
+        }
+    ],
+    "inputs": [
+        {
+            "id": "samsungtvArgs",
+            "type": "promptString",
+            "description": "Arguments for samsungtv",
+            "default": "--help"
+        }
+    ]
+}
