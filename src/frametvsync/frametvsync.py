@@ -425,6 +425,14 @@ def sync_directory(
             data, file_type=file_type_for(image_path), matte=matte, portrait_matte=matte
         )
         tv.set_favourite(content_id, status="on")
+        previous_content_id = previous.get("content_id") if previous else None
+        if previous_content_id and previous_content_id != content_id:
+            try:
+                tv.delete(previous_content_id)
+                deleted += 1
+                LOGGER.info("Deleted stale TV artwork %s for %s", previous_content_id, name)
+            except Exception as exc:
+                LOGGER.warning("Failed to delete stale artwork %s on the TV: %s", name, exc)
         state["images"][name] = {
             "mtime_ns": mtime_ns,
             "matte": matte,
@@ -526,15 +534,26 @@ def cli(argv: list[str] | None = None) -> int:
         if not args.dry_run:
             LOGGER.info("Setting TV artwork rotation to %d minutes ...", rotation)
             set_slideshow_status = getattr(tv, "set_slideshow_status", None)
+            rotation_set = False
             if callable(set_slideshow_status):
                 try:
                     set_slideshow_status(duration=rotation, category_id="MY-C0004")
+                    rotation_set = True
                 except ResponseError:
                     LOGGER.info("TV rejected slideshow API; retrying legacy rotation API")
+                    try:
+                        tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
+                        rotation_set = True
+                    except ResponseError as exc:
+                        LOGGER.warning("TV rejected both artwork rotation APIs: %s", exc)
+            if not callable(set_slideshow_status):
+                try:
                     tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
-            else:
-                tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
-            LOGGER.info("TV artwork rotation set to %d minutes", rotation)
+                    rotation_set = True
+                except ResponseError as exc:
+                    LOGGER.warning("TV rejected the artwork rotation API: %s", exc)
+            if rotation_set:
+                LOGGER.info("TV artwork rotation set to %d minutes", rotation)
         if args.reset:
             deleted_ids: set[str] = reset_tv_art(tv, dry_run=args.dry_run)
             if not args.dry_run:
