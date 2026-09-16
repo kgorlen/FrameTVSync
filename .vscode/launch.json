@@ -4,7 +4,13 @@
     // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
     "configurations": [
-        
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
         {
             "name": "samsungtv with Arguments",
             "type": "node-terminal",
@@ -17,7 +23,9 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+            "args": [
+                "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Favorites"
+            ]
         },
         {
             "name": "Python Debugger: frametvsync --dry-run",
@@ -25,15 +33,32 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["--dry-run", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+            "args": [
+                "--dry-run",
+                "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Favorites"
+            ]
         },
         {
-            "name": "Python Debugger: frametvsync --ip '192.168.1.143' --dry-run",
+            "name": "Python Debugger: frametvsync --ip '192.168.1.143' (WiFi)",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["--ip", "192.168.1.143", "--dry-run", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+            "args": [
+                "--ip",
+                "192.168.1.143"
+            ]
+        },
+        {
+            "name": "Python Debugger: frametvsync --ip '192.168.1.122' (Wire)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--ip",
+                "192.168.1.122"
+            ]
         },
         {
             "name": "Python Debugger: frametvsync --dry-run --reset",
@@ -41,15 +66,22 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["--dry-run", "--reset", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+            "args": [
+                "--dry-run",
+                "--reset",
+                "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Favorites"
+            ]
         },
         {
-            "name": "Python Debugger: frametvsync --ip '192.168.1.143' --reset",
+            "name": "Python Debugger: frametvsync --reset",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["--ip", "192.168.1.143", "--reset", "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Now Showing"]
+            "args": [
+                "--reset",
+                "\\\\NAS0\\Multimedia\\Pictures\\Art Frame\\Favorites"
+            ]
         },
         {
             "name": "Python Debugger: frametvsync --help",
@@ -57,7 +89,9 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["-h"]
+            "args": [
+                "-h"
+            ]
         },
         {
             "name": "Python Debugger: frametvsync --version",
@@ -65,13 +99,15 @@
             "request": "launch",
             "program": "${workspaceFolder}/src/frametvsync/frametvsync.py",
             "console": "integratedTerminal",
-            "args": ["--version"]
+            "args": [
+                "--version"
+            ]
         },
         {
             "name": "Python Debugger: artmode.py",
             "type": "debugpy",
             "request": "launch",
-            "program": "./src/frametvsync/artmode.py",
+            "program": "./examples/artmode.py",
             "console": "integratedTerminal",
             "args": []
         }

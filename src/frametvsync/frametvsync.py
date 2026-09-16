@@ -6,6 +6,7 @@ References:
     https://jonsully.net/blog/samsung-frame-art-api
     https://dashedyellowline.com/2024/06/07/samsung-frame-tv-lightroom/
     https://dashedyellowline.com/2025/09/15/part-2-using-chatgpt-to-create-a-frame-tv-upload-script/
+    https://www.reddit.com/r/TheFrame/comments/1c2lgbs/art_mode_api_is_back/
 
 
 """
@@ -15,343 +16,150 @@ __author__ = "Keith Gorlen"
 import argparse
 import json
 import logging
+import os
+import platform
 import re
 import sys
 from ipaddress import ip_address
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from typing import TypedDict, cast
+from time import sleep
+from typing import Any, NoReturn, TypedDict, cast
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+"""Path to directory containing this Python script."""
+sys.path.append(str(SCRIPT_DIR))
+"""Allow runstarnet CLI to import modules from script directory."""
+
+# pylint: disable=wrong-import-position
+from __init__ import __version__  # pylint: disable=no-name-in-module
 from PIL import Image
 from samsungtvws import SamsungTVArt
-from samsungtvws.exceptions import ResponseError, UnauthorizedError
+from samsungtvws.exceptions import ConnectionFailure, ResponseError, UnauthorizedError
 
+# pylint: enable=wrong-import-position
+
+# Global Constants
+
+SCRIPT_NAME: str = os.path.basename(__file__).split(".")[0]
+"""Name of this script without .py extension."""
 LOGGER = logging.getLogger("frametvsync")
-
+"""Logger object."""
 LOG_MAX_BYTES = 5 * 1024 * 1024
+"""Max rotating logfile size."""
 LOG_BACKUP_COUNT = 5
+"""Max number of log files."""
+STATE_VERSION: int = 1
+"""State JSON file version number."""
+DEFAULT_PORT: int = 8002
+"""Default Samsung Frame TV port."""
+DEFAULT_ROTATION: int = 10
+"""Default slideshow rotation interval in minutes."""
+TV_REQUEST_TIMEOUT: int = 10
+"""Timeout for TV requests in seconds."""
+SYNC_STATE: str = ".sync_state/.frametvsync_state.json"
+"""Path to sync state file."""
+TOKEN_FILE: str = ".sync_state/.frametvsync.token"
+"""Path to token file."""
+VALID_IMAGE_SUFFIXES: set[str] = {".jpg", ".jpeg"}
+"""Valid image file extensions."""
+# VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}  # .png files cause websocket connection closed during upload errors
+DEFAULT_MATTE_TYPE: str = "shadowbox"
+"""Default supported matte type."""
+DEFAULT_MATTE_COLOR: str = "black"
+"""Default supported matte color."""
+
+
+# Global variables
+
+ARGS: argparse.Namespace = argparse.Namespace()
+"""Parsed arguments."""
+WARNINGS: int = 0
+"""Warning message count."""
+
+
+def notify(title: str, message: str) -> None:
+    """Post notification.
+
+    Args:
+        title (str): Title of the notification.
+        message (str): Message to display in the notification.
+    """
+    system: str = platform.system()
+
+    if system == "Windows":
+        from win11toast import notify as win_notify
+
+        win_notify(title, message)
+
+    elif system == "Darwin":
+        import subprocess
+
+        subprocess.run(
+            [
+                "osascript",
+                "-e",
+                f'display notification "{message}" with title "{title}"',
+            ],
+            check=True,
+        )
+
+    else:
+        raise RuntimeError(f"Unsupported platform: {system}")
+
+
+def cleanup_and_exit(status: int = 0) -> NoReturn:
+    """Clean up and exit with the given status code.
+
+    Args:
+        status (int): Exit status code. Defaults to 0.
+    """
+    LOGGER.info(f"{SCRIPT_NAME} finished.")
+    LOGGER.info(f"{'=' * 60}")
+    logging.shutdown()
+    sys.exit(status)
+
+
+def warn_msg(msg: str) -> None:
+    """Print a WARNING message and increment the warning count.
+
+    Args:
+        msg (str): Warning message to display.
+    """
+    global WARNINGS
+    LOGGER.warning(msg)
+    WARNINGS += 1
+
+
+def fatal_error(msg: str) -> NoReturn:
+    """Print a CRITICAL message and sys.exit(1).
+
+    Args:
+        msg (str): Error message to display.
+    """
+    LOGGER.critical(f"{msg}; exiting.")
+    notify("FrameTVSync", msg)
+    cleanup_and_exit(1)
 
 
 class ConsoleHandler(logging.StreamHandler):
     pass
 
 
-STATE_VERSION = 1
-DEFAULT_PORT = 8002
-DEFAULT_ROTATION = 10
-TV_REQUEST_TIMEOUT = 10.0
-VALID_IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png"}
-# --- Matte dictionaries (style + color) ---
-MATTE_TYPES = {
-    "none",
-    "modernthin",
-    "modern",
-    "modernwide",
-    "flexible",
-    "shadowbox",
-    "panoramic",
-    "triptych",
-    "mix",
-    "squares",
-}
-MATTE_COLORS = {
-    "black",
-    "neutral",
-    "antique",
-    "warm",
-    "polar",
-    "sand",
-    "seafoam",
-    "sage",
-    "burgundy",
-    "navy",
-    "apricot",
-    "byzantine",
-    "lavender",
-    "redorange",
-    "skyblue",
-    "turquoise",
-}
+def configure_logging(directory: Path) -> None:
+    """Configure console logging and rotating logs.
 
+    Args:
+        directory (Path): Directory to store log files.
 
-class TVState(TypedDict):
-    ip: str
-    port: int
-    rotation: int
-
-
-class ImageState(TypedDict):
-    mtime_ns: int
-    matte: str
-    content_id: str
-
-
-class State(TypedDict):
-    version: int
-    tv: TVState
-    images: dict[str, ImageState]
-
-
-def is_portrait(path: Path) -> bool:
-    try:
-        with Image.open(path) as im:
-            w, h = im.size
-            return h > w
-    except Exception:
-        return False
-
-
-def file_type_for(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext == ".png":
-        return "PNG"
-    return "JPEG"
-
-
-def get_matte_id(hierarchical_subjects: str | None) -> str:
-    """Convert matte metadata from XMP HierarchicalSubject to the TV matte_id format.
-
-    Arguments:
-        hierarchical_subjects: The full hierarchicalSubject string from the XMP metadata.
-
-    Returns:
-        A string in the format "<matte_type>_<matte_color>", e.g. "modern_polar".
-        If the matte type is "none" or "custom", returns "none_none".
-        If the matte color is not specified, defaults to "black" (e.g., "modern_black").
-        If the matte type is not found or unrecognized, logs a warning and returns "none_none".
-
-    hierarchicalSubject format:
-        *Art_Frame|Matte|<matte_type>*
-        *Art_Frame|Color|<matte_color>*
     """
-
-    try:
-        if hierarchical_subjects is None:
-            raise ValueError("No hierarchicalSubject")
-
-        hierarchical_subjects = hierarchical_subjects.strip()
-        if not hierarchical_subjects:
-            raise ValueError("Empty hierarchicalSubject")
-
-        if m := re.search(
-            r"\*\s*Art_Frame\s*\|\s*Matte\s*\|\s*([^*]+)",
-            hierarchical_subjects,
-            flags=re.IGNORECASE,
-        ):
-            matte_type: str = m.group(1).strip().lower()
-        else:
-            raise ValueError("No Art_Frame|Matte found in hierarchicalSubject")
-
-        if matte_type in ("none", "custom"):
-            return "none_none"  # Default color none for no matte or custom matte
-
-        if matte_type not in MATTE_TYPES:
-            raise ValueError(f"Unknown matte type: {matte_type}")
-
-        if m := re.search(
-            r"\*\s*Art_Frame\s*\|\s*Matte_Color\s*\|\s*([^*]+)",
-            hierarchical_subjects,
-            flags=re.IGNORECASE,
-        ):
-            matte_color: str = m.group(1).strip().lower()
-        else:
-            return f"{matte_type}_black"  # Default to black if no color is specified
-
-        if matte_color not in MATTE_COLORS:
-            raise ValueError(f"Unknown matte color: {matte_color}")
-    except ValueError as exc:
-        LOGGER.warning(exc)
-        return "none_none"
-
-    return f"{matte_type}_{matte_color}"
-
-
-def should_ignore_content_id(content_id: str | None) -> bool:
-    """Samsung Art Store content identifiers should not be treated as user-managed images."""
-    if not content_id:
-        return False
-    return content_id.upper().startswith("SAM-")
-
-
-def reset_tv_art(tv: SamsungTVArt, dry_run: bool) -> set[str]:
-    """Delete all user-uploaded artwork from the TV and return deleted content IDs."""
-    content_ids = {
-        str(item.get("content_id")).strip()
-        for item in tv.available()
-        if isinstance(item, dict) and item.get("content_id")
-    }
-    content_ids -= {
-        content_id for content_id in content_ids if should_ignore_content_id(content_id)
-    }
-
-    if not content_ids:
-        LOGGER.info("No non-Samsung Art Store images found on the TV.")
-        return set()
-
-    if dry_run:
-        for content_id in sorted(content_ids):
-            LOGGER.info("DRY-RUN: would delete TV artwork %s", content_id)
-        return content_ids
-
-    answer = input(f"Delete {len(content_ids)} non-Samsung Art Store image(s) from the TV? [y/N] ")
-    if answer.strip().lower() not in {"y", "yes"}:
-        LOGGER.info("Reset cancelled.")
-        return set()
-
-    deleted: set[str] = set()
-    for content_id in sorted(content_ids):
-        try:
-            tv.delete(content_id)
-            deleted.add(content_id)
-            LOGGER.info("Deleted TV artwork %s", content_id)
-        except Exception as exc:  # pragma: no cover - runtime interaction  # noqa: BLE001
-            LOGGER.warning("Failed to delete %s on the TV: %s", content_id, exc)
-    return deleted
-
-
-def load_state(path: Path) -> State:
-    """Load or create the JSON state file used to track uploaded images."""
-    default_state: State = {
-        "version": STATE_VERSION,
-        "tv": {"ip": "", "port": DEFAULT_PORT, "rotation": DEFAULT_ROTATION},
-        "images": {},
-    }
-
-    if not path.exists():
-        save_state(path, default_state)
-        return default_state
-
-    try:
-        with path.open("r", encoding="utf-8") as handle:
-            loaded = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        save_state(path, default_state)
-        return default_state
-
-    if not isinstance(loaded, dict):
-        save_state(path, default_state)
-        return default_state
-
-    normalized = default_state.copy()
-    loaded_tv = loaded.get("tv")
-    if isinstance(loaded_tv, dict):
-        normalized["tv"] = cast(
-            TVState,
-            {
-                "ip": loaded_tv.get("ip", default_state["tv"]["ip"]),
-                "port": loaded_tv.get("port", default_state["tv"]["port"]),
-                "rotation": loaded_tv.get("rotation", default_state["tv"]["rotation"]),
-            },
-        )
-    normalized["images"] = (
-        cast(dict[str, ImageState], loaded["images"])
-        if isinstance(loaded.get("images"), dict)
-        else {}
-    )
-    normalized["version"] = STATE_VERSION
-    save_state(path, normalized)
-    return normalized
-
-
-def save_state(path: Path, state: State) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as handle:
-        json.dump(state, handle, indent=2, sort_keys=True)
-        handle.write("\n")
-
-
-def read_xmp_subject(path: Path) -> str | None:
-    """Read Lightroom's hierarchicalSubject XMP metadata from a JPEG.
-
-    Arguments:
-        path (Path): The path to the JPEG file.
-
-    Returns:
-        str | None: The hierarchical subject string or None if not found.
-    """
-    try:
-        with Image.open(path) as image:
-            xmp_raw = None
-            if "xmp" in image.info:
-                xmp_raw = image.info.get("xmp")
-            else:
-                getter = getattr(image, "getxmp", None)
-                if callable(getter):
-                    xmp_raw = getter()
-
-            if not xmp_raw:
-                return None
-
-            if isinstance(xmp_raw, bytes):
-                xmp_text = xmp_raw.decode("utf-8", errors="ignore")
-            else:
-                xmp_text = str(xmp_raw)
-
-            if m := re.search(
-                r"<(?:[A-Za-z_][\w.-]*:)?hierarchicalSubject>.*?<rdf:(?:Bag|Seq)>(.*?)</rdf:(?:Bag|Seq)>",
-                xmp_text,
-                flags=re.DOTALL | re.IGNORECASE,
-            ):
-                items = re.findall(
-                    r"<rdf:li[^>]*>(.*?)</rdf:li>", m.group(1), flags=re.DOTALL | re.IGNORECASE
-                )
-                if items:
-                    return "*".join(item.strip() for item in items if item.strip())
-
-            return None
-
-    except Exception as exc:  # noqa: BLE001
-        LOGGER.error("Error reading XMP HierarchicalSubject from %s: %s", path, exc)
-
-    return None
-
-
-def read_matte_tag(path: Path) -> str:
-    matte_source = read_xmp_subject(path)
-    if matte_source:
-        return get_matte_id(matte_source)
-    LOGGER.warning("No Lightroom hierarchical matte found for %s; using shadowbox_black", path)
-    return "shadowbox_black"
-
-
-def connect_tv(ip: str, port: int, token_file: str) -> SamsungTVArt:
-    LOGGER.info("Connecting to Samsung Frame TV at %s:%d ...", ip, port)
-    token_path: Path = Path(token_file).expanduser()
-    token_path.parent.mkdir(parents=True, exist_ok=True)
-    token: str = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else ""
-    if token_path.exists() and not token:
-        token_path.unlink()
-    try:
-        tv = SamsungTVArt(
-            host=ip,
-            port=port,
-            token_file=str(token_path),
-            name="frametvsync",
-            timeout=TV_REQUEST_TIMEOUT,
-        )
-        tv.open()
-        tv.available()
-        token = token_path.read_text(encoding="utf-8").strip() if token_path.exists() else ""
-        if not token:
-            LOGGER.warning("SamsungTVWS connected but did not write a token to %s", token_path)
-        LOGGER.info("Connected to Samsung Frame TV at %s:%d.", ip, port)
-        return tv
-    except UnauthorizedError as exc:  # pragma: no cover - runtime interaction
-        raise RuntimeError(
-            "The TV rejected the connection. Approve the pairing request on the TV, then retry. "
-            f"If no prompt appears, delete {token_path} and retry."
-        ) from exc
-
-
-def configure_logging(directory: Path, quiet: bool = False) -> None:
-    """Configure console logging and rotating logs for a sync directory."""
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
 
     console_handlers = [
         handler for handler in logger.handlers if isinstance(handler, ConsoleHandler)
     ]
-    if quiet:
+    if ARGS.quiet:
         for handler in console_handlers:
             logger.removeHandler(handler)
     elif not console_handlers:
@@ -383,93 +191,763 @@ def configure_logging(directory: Path, quiet: bool = False) -> None:
         logger.addHandler(file_handler)
 
 
-def sync_directory(
-    tv: SamsungTVArt | None, directory: Path, state: State, dry_run: bool
-) -> tuple[int, int]:
-    """Upload any newer or changed local images and prune stale state entries no longer present locally."""
-    local_files: dict[str, Path] = {
-        path.name: path
-        for path in sorted(directory.iterdir())
+class PubImage(Path):
+    """pathlib.Path subclass for published image files."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        """Initialize a PubImage instance and read its metadata."""
+
+        super().__init__(*args, **kwargs)
+
+        LOGGER.info(f"Reading image metadata for {self} ...")
+        self.image: Image.Image = Image.open(self)
+        """Image object for this file."""
+        self.mtime_ns: int = self.stat().st_mtime_ns
+        """Image file modification time in nanoseconds."""
+        self.matte_id: str = self._get_matte_id()
+        """Image matte ID derived from Lightroom's HierarchicalSubject XMP metadata."""
+
+        # Published files usually do not have capture time.
+
+        # try:
+        #     # Parse string into a timezone-aware datetime object
+        #     capture_time = self._image.getexif().get(36867)
+        #     if capture_time is not None:
+        #         # Convert to the local system timezone
+        #         self._capture_time = (
+        #             parser.parse(str(capture_time)).astimezone().strftime("%Y:%m:%d %H:%M:%S")
+        #         )
+        # except Exception as exc:
+        #     warn_msg(f"Error reading capture time from EXIF for {self.name}: {exc}")
+
+        LOGGER.info(
+            f"{self.name} metadata: size={self.image.width}x{self.image.height}, "
+            f"mtime_ns={self.mtime_ns}, matte_id={self.matte_id}."
+        )
+
+    def with_segments(self, *segments):
+        """
+        CRITICAL: Ensures path modifications (.parent, / operator)
+        generate a brand new path instance with its own unique object ID.
+        """
+        return PubImage(*segments)
+
+    def get_data(self) -> bytes:
+        """Read the image file data as bytes.
+
+        Returns:
+            bytes: The image file data as bytes.
+        """
+        return self.read_bytes()
+
+    def size(self) -> tuple[int, int]:
+        """Return the image size as a tuple (width, height).
+
+        Returns:
+            tuple[int, int]: The image size as a tuple (width, height).
+        """
+        return self.image.size
+
+    def is_portrait(self) -> bool:
+        """Return True if portrait aspect ratio.
+        Returns:
+            bool: True if portrait aspect ratio.
+        """
+        w, h = self.image.size
+        return h > w
+
+    def _read_xmp_subject(self) -> str | None:
+        """Read Lightroom's HierarchicalSubject XMP metadata from a JPEG.
+
+        Returns:
+            str | None: The hierarchical subject string or None if not found.
+        """
+        try:
+            xmp_raw: Any | None = None
+            if "xmp" in self.image.info:
+                xmp_raw = self.image.info.get("xmp")
+            else:
+                getter = getattr(self.image, "getxmp", None)
+                if callable(getter):
+                    xmp_raw = getter()
+
+            if not xmp_raw:
+                return None
+
+            if isinstance(xmp_raw, bytes):
+                xmp_text: str = xmp_raw.decode("utf-8", errors="ignore")
+            else:
+                xmp_text = str(xmp_raw)
+
+            if m := re.search(
+                r"<(?:[A-Za-z_][\w.-]*:)?hierarchicalSubject>.*?<rdf:(?:Bag|Seq)>(.*?)</rdf:(?:Bag|Seq)>",
+                xmp_text,
+                flags=re.DOTALL | re.IGNORECASE,
+            ):
+                items = re.findall(
+                    r"<rdf:li[^>]*>(.*?)</rdf:li>", m.group(1), flags=re.DOTALL | re.IGNORECASE
+                )
+                if items:
+                    return "*".join(item.strip() for item in items if item.strip())
+
+            return None
+
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.error(f"Error reading XMP HierarchicalSubject from {self.name}: {exc}")
+
+        return None
+
+    def _get_matte_id(self) -> str:
+        """Convert matte metadata from XMP HierarchicalSubject to the TV matte_id format.
+
+        Args:
+            hierarchical_subjects (str): The full hierarchicalSubject string from the XMP metadata.
+
+        Returns:
+            A string in the format "<matte_type>_<matte_color>", e.g. "modern_polar".
+            If the matte type is "none" or "custom", returns "none_none".
+            If the matte type is not found or unsupported, logs a warning and returns "none_none".
+            If the matte color is not specified, defaults to "black" (e.g., "modern_black").
+
+        hierarchicalSubject format:
+            *Art_Frame|Matte|<matte_type>*
+            *Art_Frame|Color|<matte_color>*
+        """
+
+        hierarchical_subjects: str | None = self._read_xmp_subject()
+
+        try:
+            if hierarchical_subjects is None:
+                raise ValueError("No HierarchicalSubject")
+
+            hierarchical_subjects = hierarchical_subjects.strip()
+            if not hierarchical_subjects:
+                raise ValueError("Empty HierarchicalSubject")
+
+            matte_types: list[str]
+            if matte_types := sorted(
+                re.findall(
+                    r"\*\s*Art_Frame\s*\|\s*Matte\s*\|\s*([^*]+)",
+                    hierarchical_subjects,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                matte_type: str = matte_types[0].strip().lower()
+                if len(matte_types) > 1:
+                    warn_msg(
+                        f"{len(matte_types)} matte types found in {self.name}: {', '.join(matte_type for matte_type in matte_types)}; using {matte_type}."
+                    )
+            else:
+                raise ValueError("No Art_Frame|Matte found in HierarchicalSubject")
+
+            if matte_type in ("none", "custom"):
+                return "none_none"  # Default color none for no matte or custom matte
+
+            matte_colors: list[str]
+            if matte_colors := sorted(
+                re.findall(
+                    r"\*\s*Art_Frame\s*\|\s*Matte_Color\s*\|\s*([^*]+)",
+                    hierarchical_subjects,
+                    flags=re.IGNORECASE,
+                )
+            ):
+                matte_color: str = matte_colors[0].strip().lower()
+                if len(matte_colors) > 1:
+                    warn_msg(
+                        f"{len(matte_colors)} matte colors found in {self.name}: {', '.join(matte_color for matte_color in matte_colors)}; using {matte_color}."
+                    )
+                return f"{matte_type}_{matte_color}"
+
+            else:
+                return f"{matte_type}_black"  # Default to black if no color is specified
+
+        except ValueError as exc:
+            warn_msg(f"{exc}.")
+            return "none_none"
+
+
+class FrameImage:
+    """Frame art metadata returned by available()."""
+
+    def __init__(
+        self,
+        category_id: str,
+        content_id: str,
+        image_date: str,
+        matte_id: str,
+        height: int,
+        width: int,
+    ) -> None:
+        """Initialize FrameImage metadata.
+
+        Args:
+            category_id (str): Category ID, format: MY_Cnnnn
+                MY-C0002: My Photos
+                MY-C0003: Samsung Collection
+                MY-C0004: Favorites
+            content_id (str): Content ID:
+                MY_Fnnnn: My Photo
+                SAM_...:  Samsung art
+            image_date (str): Image date, format: YYYY:MM:DD hh:mm:ss.
+            matte_id (str): Matte ID, format <matte type>_<color>, e.g. shadowbox_black.
+            height (int): Image height in pixels.
+            width (int): Image width in pixels.
+        """
+
+        self.category_id = category_id.strip().upper()
+        """Category ID."""
+        self.content_id = content_id.strip().upper()
+        """Content ID."""
+        self.image_date = image_date.strip()
+        """Image date, format: YYYY:MM:DD hh:mm:ss."""
+        self.matte_id = matte_id.strip().lower()
+        """Matte ID, format <matte type>_<color>, e.g. shadowbox_black."""
+        self.height = height
+        """Image height in pixels."""
+        self.width = width
+        """Image width in pixels."""
+
+
+class TVState(TypedDict):
+    """TV state in .frametvsync_state.json file."""
+
+    ip: str
+    """IP address."""
+    port: int
+    """Port number."""
+    rotation: int
+    """Slideshow rotation interval in minutes."""
+
+
+class ImageState(TypedDict):
+    """Frame art image state in .frametvsync_state.json file."""
+
+    content_id: str
+    """Content ID, assigned by TV on upload, format: MY_Fnnnn."""
+    mtime_ns: int
+    """Published image modification time in ns."""
+    matte: str
+    """Published image matte from HierarchicalImage """
+
+
+class FrameArt:
+    """Samsung Frame TV."""
+
+    def __init__(self, token_file: Path, ip: str, port: int, rotation: int) -> None:
+        """Initialize the Samsung Frame TV connection and download its artwork.
+
+        Args:
+            token_file (Path): Path to the Samsung TV authorization token.
+            ip (str): Samsung Frame TV IP address.
+            port (int): Samsung Frame TV port.
+            rotation (int): Slideshow rotation interval in minutes.
+        """
+
+        self.matte_ids: set[str] = set()
+        """Supported matte types and colors downloaded from TV."""
+        self.frame_art: dict[str, FrameImage] = {}
+        """Frame images currently available on the TV, keyed by content_id."""
+        self.tv: SamsungTVArt
+        """SamsungTVArt object"""
+        self.deleted_art: set[str] = set()
+        """content_ids of deleted art."""
+        self._image_count: int = 0
+        """content_id sequnce number for --dry-run."""
+
+        LOGGER.info(f"Connecting to Samsung Frame TV at {ip}:{port} ...")
+
+        token: str = ""
+        """Samsung Frame TV authorization token."""
+        if token_file.is_file():
+            token = token_file.read_text(encoding="utf-8").strip()
+            if token:
+                LOGGER.info(f"Using auth token from {token_file}.")
+            else:
+                token_file.unlink()
+                LOGGER.info(f"No auth token found in {token_file}.")
+        else:
+            LOGGER.info(f"No auth token file found at {token_file}.")
+
+        try:
+            self.tv = SamsungTVArt(
+                host=ip,
+                port=port,
+                token_file=str(token_file),
+                name="frametvsync",
+                timeout=TV_REQUEST_TIMEOUT,
+            )
+
+            self.tv.open()
+
+            if not self.tv.get_artmode():
+                LOGGER.info("Switching to art mode ...")
+                self.tv.set_artmode(True)
+
+            self.download_art()
+
+            matte_ids: list[dict[str, str]] = self.tv.get_matte_list()["matte_types"]
+            self.matte_ids = {matte_id["matte_id"].strip().lower() for matte_id in matte_ids}
+            self.matte_ids.add("none_none")
+            LOGGER.info(f"Supported matte ids: {', '.join(sorted(self.matte_ids))}")
+
+            if f"{DEFAULT_MATTE_TYPE}_{DEFAULT_MATTE_COLOR}" not in self.matte_ids:
+                fatal_error(
+                    f"Default matte id {DEFAULT_MATTE_TYPE}_{DEFAULT_MATTE_COLOR} not supported by TV."
+                )
+
+            token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
+            if not token:
+                warn_msg(f"SamsungTVWS connected but did not write a token to {token_file}.")
+
+            LOGGER.info(f"Connected to Samsung Frame TV at {ip}:{port}.")
+
+        except UnauthorizedError as exc:  # pragma: no cover - runtime interaction
+            raise RuntimeError(
+                "The TV rejected the connection. Approve the pairing request on the TV, then retry. "
+                f"If no prompt appears, delete {token_file} and retry."
+            ) from exc
+
+    def supported_matte_id(self, pub_image: PubImage) -> str:
+        """Convert matte ID to one supported by the TV.
+
+        Args:
+            pub_image (PubImage): Published image.
+
+        Returns:
+            str: A supported matte_id.
+        """
+
+        matte_type, matte_color = pub_image.matte_id.split("_")
+        if matte_type != "none" and not f"{matte_type}_black" in self.matte_ids:
+            warn_msg(
+                f'Unsupported matte type "{matte_type}" for {pub_image.name}, using {DEFAULT_MATTE_TYPE}.'
+            )
+            matte_type = DEFAULT_MATTE_TYPE
+        if matte_color != "none" and not f"shadowbox_{matte_color}" in self.matte_ids:
+            ok_color = "none" if matte_type == "none" else DEFAULT_MATTE_COLOR
+            warn_msg(
+                f'Unsupported matte color "{matte_color}" for {pub_image.name}, using "{ok_color}".'
+            )
+            return f"{matte_type}_{ok_color}"
+
+        return f"{matte_type}_{matte_color}"
+
+    def set_rotation(self, rotation: int) -> bool:
+        """Set slideshow rotation interval.
+
+        Args:
+            rotation (int): Slideshow rotation interval in minutes.
+
+        Returns:
+            bool: True if rotation set succussfully.
+        """
+
+        if ARGS.dry_run:
+            return True
+
+        LOGGER.info(f"Setting TV artwork rotation to {rotation} minutes ...")
+        set_slideshow_status = getattr(self.tv, "set_slideshow_status", None)
+        if callable(set_slideshow_status):
+            try:
+                set_slideshow_status(duration=rotation, category_id="MY-C0004")
+            except ResponseError:
+                LOGGER.info("TV rejected slideshow API; trying legacy rotation API ...")
+                try:
+                    self.tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
+                except ResponseError as exc:
+                    warn_msg(f"TV rejected both artwork rotation APIs: {exc}.")
+                    return False
+
+        else:
+            try:
+                self.tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
+            except ResponseError as exc:
+                warn_msg(f"TV rejected the artwork rotation API: {exc}.")
+                return False
+
+        LOGGER.info(f"TV artwork rotation set to {rotation} minutes.")
+        return True
+
+    def download_art(self) -> dict[str, FrameImage]:
+        """Download available art metadata from TV.
+
+        Returns:
+            dict[str, FrameImage]: Dictionary of FrameImage objects keyed by content_id.
+        """
+        LOGGER.info("Downloading Samsung Frame TV artwork information ...")
+        tv_images = self.tv.available()
+        self.frame_art = {
+            image["content_id"]: FrameImage(**image)
+            for image in tv_images
+            if image["content_id"].startswith("MY_")
+        }
+        LOGGER.info(f"Downloaded {len(self.frame_art)} artwork items from the TV.")
+
+        return self.frame_art
+
+    def upload_art(self, pub_image: PubImage) -> str:
+        """Upload a published image to the TV.
+
+        Args:
+            pub_image (PubImage): Image to publish.
+
+        Returns:
+            str: Content_id of uploaded image assigned by TV or "" if upload failed.
+        """
+
+        supported_matte_id: str = self.supported_matte_id(pub_image)
+        LOGGER.info(f"Reading image data for {pub_image.name} ...")
+        image_data: bytes = pub_image.get_data()
+
+        try:
+            if ARGS.dry_run:
+                if "PLUMBING PROBLEM!!!" in pub_image.stem:
+                    LOGGER.info(f"DRY-RUN: Simulating {pub_image.name} upload failure ...")
+                    raise ConnectionFailure("DRY-RUN: Simulated upload failure.")
+
+                LOGGER.info(
+                    "DRY-RUN: Would upload %s with matte=%s.",
+                    pub_image.name,
+                    supported_matte_id,
+                )
+                self._image_count += 1
+                return f"XX_F{self._image_count:04d}"  # Dummy content_id for --dry-run
+
+            LOGGER.info(f"Uploading {pub_image.name} with matte={supported_matte_id} ...")
+
+            content_id: str = self.tv.upload(
+                image_data,
+                file_type="PNG" if pub_image.suffix.lower() == ".png" else "JPEG",
+                matte=supported_matte_id,
+                portrait_matte=supported_matte_id,
+                # date=(pub_image.capture_time if pub_image.capture_time else None)
+            )
+        except Exception as exc:  # noqa: BLE001
+            warn_msg(f"Failed to upload TV artwork {pub_image.name}: {exc}")
+            return ""
+
+        LOGGER.info(f"Uploaded {pub_image.name}.")
+        sleep(2)
+        LOGGER.info(f"{pub_image.name} uploaded, content_id {content_id}.")
+        LOGGER.info(f"Setting {pub_image.name} as favorite ...")
+        self.tv.set_favourite(content_id, status="on")
+        LOGGER.info(f"{pub_image.name} set as favorite.")
+        return content_id
+
+    def delete_art(self, content_id: str, image_name: str | None = None) -> bool:
+        """Delete art from TV.
+
+        Args:
+            content_id (str): content_id of image to be deleted.
+            image_name (str | None, optional): Name of published image. Defaults to None.
+
+        Returns:
+            bool: True if delete successful
+        """
+
+        art_name: str = f" {image_name}" if image_name else ""
+
+        if ARGS.dry_run:
+            if image_name and "PLUMBING PROBLEM!!!" in image_name:
+                LOGGER.info(f"DRY-RUN: Simulating {image_name} delete failure ...")
+                return False
+
+            LOGGER.info(f"DRY-RUN: Would delete TV artwork {content_id}{art_name}.")
+            self.deleted_art.add(content_id)
+            return True
+
+        LOGGER.info(f"Deleting TV artwork {content_id}{art_name} ...")
+        try:
+            self.tv.delete(content_id)
+            LOGGER.info(f"Deleted TV artwork {content_id}{art_name}.")
+            sleep(2)
+        except Exception as exc:  # pragma: no cover - runtime interaction  # noqa: BLE001
+            warn_msg(f"Failed to delete TV artwork {content_id}{art_name}: {exc}.")
+            return False
+
+        LOGGER.info(f"TV artwork {content_id}{art_name} deleted.")
+        self.deleted_art.add(content_id)
+        return True
+
+
+class SyncStats:
+    """Sync statistics returned by SyncStats.discover_changes()."""
+
+    def __init__(self, unknown, missing, deleted, added, modified) -> None:
+        self.unknown: int = unknown
+        """Number of images that were found on the TV but not published."""
+        self.missing: int = missing
+        """Number of images that were found on the TV but were not published."""
+        self.deleted: int = deleted
+        """Number of images that were deleted from the published folder."""
+        self.added: int = added
+        """Number of images that were added to the published folder."""
+        self.modified: int = modified
+        """Number of images that were modified in the published folder."""
+
+    def __str__(self) -> str:
+        return f"Unknown: {self.unknown}, Missing: {self.missing}, Deleted: {self.deleted}, Added: {self.added}, Modified: {self.modified}"
+
+
+class SyncState:
+    """Published folder <-> Frame TV synchronization state."""
+
+    def __init__(self, state_file: Path) -> None:
+        """Initialize sync state.
+
+        Args:
+            state_file (Path): Path to the JSON file storing the sync state.
+        """
+        self.pub_dir: Path = ARGS.directory
+        """Lightroom publish directory containing images to sync with the TV."""
+        self.pub_dir: Path = ARGS.directory
+        """Lightroom publish directory containing images to sync with the TV."""
+        self.state_file: Path = state_file
+        """Path to the JSON file storing the sync state."""
+        self.version: int = STATE_VERSION
+        """Version of the sync state format."""
+        self.tv_state: TVState = {
+            "ip": str(ARGS.ip) or "",
+            "port": DEFAULT_PORT,
+            "rotation": ARGS.rotation,
+        }
+        """State of the connected Samsung Frame TV."""
+        self.images: dict[str, ImageState] = {}
+        """Image state keyed by filename."""
+        self.id_map: dict[str, str] = {}
+        """Image name keyed by TV content_id."""
+        self.to_upload: list[PubImage] = []
+        """List of images that need to be uploaded to the TV."""
+        self.to_delete: list[str] = []
+        """List of content_ids of images that need to be deleted from the TV."""
+
+        if not self.state_file.exists():
+            LOGGER.info(f"No existing sync state file found at {self.state_file}; initializing.")
+            if not ARGS.ip:
+                fatal_error("A TV IP address is required, specify --ip..")
+
+            self.tv_state["ip"] = str(ARGS.ip)
+            return
+
+        LOGGER.info(f"Loading sync state from {self.state_file} ...")
+        with self.state_file.open("r", encoding="utf-8") as file:
+            state = json.load(file)
+        LOGGER.info(f"Sync state loaded from {self.state_file}.")
+
+        if state["version"] != STATE_VERSION:
+            fatal_error(
+                f"State file version mismatch: expected {STATE_VERSION}, found {state['version']}. ",
+            )
+
+        self.tv_state = state["tv"]
+        if ARGS.ip and self.tv_state["ip"] != ARGS.ip:
+            self.tv_state["ip"] = str(ARGS.ip)
+        self.images = cast(dict[str, ImageState], state["images"])
+        self.id_map = {image["content_id"]: name for name, image in self.images.items()}
+        LOGGER.info(f"Loaded {len(self.images)} image state entries from {self.state_file}.")
+
+    def __len__(self) -> int:
+        return len(self.images)
+
+    def save(self) -> None:
+        """Save sync state to file."""
+
+        LOGGER.info(f"Saving sync state to {self.state_file} ...")
+        self.pub_dir.mkdir(parents=True, exist_ok=True)
+        with self.state_file.open("w", encoding="utf-8") as file:
+            json.dump(
+                {"version": self.version, "tv": self.tv_state, "images": self.images},
+                file,
+                indent=2,
+            )
+            file.write("\n")
+        LOGGER.info(f"Sync state saved to {self.state_file}.")
+
+    def discover_changes(self, pub_images: dict[str, PubImage], frame_art: FrameArt) -> SyncStats:
+        """Update the sync state and to_delete and to_upload lists.
+
+        Args:
+            pub_images (dict[str, PubImage]): Dictionary of published images keyed by filename.
+            frame_art (FrameArt): FrameArt object containing the TV artwork.
+
+        Returns:
+            dict[str, int]: Dictionary of counts keyed by type: unknown, missing, deleted, added, and modified.
+        """
+        unknown: int = 0
+        """Count of unknown images on TV to be deleted."""
+        missing: int = 0
+        """Count of images missing on TV."""
+        deleted: int = 0
+        """Count of deleted published images."""
+        added: int = 0
+        """Count of added published images."""
+        modified: int = 0
+        """Count of modified published images."""
+
+        LOGGER.info("Checking for unknown images on TV ...")
+        for unknown, content_id in enumerate(frame_art.frame_art.keys() - self.id_map.keys(), 1):
+            LOGGER.info(f"Adding content_id {content_id} of unknown image to delete list.")
+            self.to_delete.append(content_id)
+
+        LOGGER.info("Checking for missing images on TV ...")
+        for missing, content_id in enumerate(self.id_map.keys() - frame_art.frame_art.keys(), 1):
+            image_name = self.id_map[content_id]
+            LOGGER.info(
+                f"Deleting content_id {content_id} of missing image {image_name} from sync state."
+            )
+            del self.images[image_name]
+            del self.id_map[content_id]
+
+        LOGGER.info("Processing deleted published images ...")
+        for deleted, image in enumerate(self.images.keys() - pub_images.keys(), 1):
+            content_id = self.images[image]["content_id"]
+            LOGGER.info(f"Adding content_id {content_id} of deleted image {image} to delete list.")
+            self.to_delete.append(content_id)
+            del self.images[image]
+            del self.id_map[content_id]
+
+        LOGGER.info("Processing new published images ...")
+        for added, pub_image_name in enumerate(pub_images.keys() - self.images.keys(), 1):
+            LOGGER.info(f"Adding new published image {pub_image_name} to upload list.")
+            pub_image: PubImage = pub_images[pub_image_name]
+            self.to_upload.append(pub_image)
+
+        LOGGER.info("Processing modified published images ...")
+        for pub_image_name in pub_images.keys() & self.images.keys():
+            pub_image = pub_images[pub_image_name]
+            image_state: ImageState = self.images[pub_image_name]
+            if (
+                pub_image.mtime_ns != image_state["mtime_ns"]
+                or pub_image.matte_id != image_state["matte"]
+            ):
+                content_id = image_state["content_id"]
+                LOGGER.info(
+                    f"Adding content_id {content_id} of modified image {pub_image.name} to upload and delete lists."
+                )
+                self.to_upload.append(pub_image)
+                self.to_delete.append(content_id)
+                modified += 1
+
+        return SyncStats(unknown, missing, deleted, added, modified)
+
+    def commit_changes(self, frame_art: FrameArt) -> tuple[int, int]:
+        """Commit art deletions and uploads to TV.
+
+        Args:
+            frame_art (FrameArt): FrameArt object containing the TV artwork.
+
+        Returns:
+            tuple[int, int]: Tuple of counts of deleted and uploaded images.
+        """
+
+        deleted: int = 0
+        """Count of images deleted from TV."""
+        uploaded: int = 0
+        """Count of image uploads to TV."""
+
+        dry_run: str = "would be " if ARGS.dry_run else ""
+
+        for content_id in self.to_delete:
+            image_name = self.id_map.get(content_id, None)
+            if frame_art.delete_art(content_id, image_name):
+                deleted += 1
+
+        LOGGER.info(f"{len(self.to_delete)} images {dry_run}deleted from TV.")
+        self.to_delete.clear()
+
+        for pub_image in self.to_upload:
+            new_content_id = frame_art.upload_art(pub_image)
+            if new_content_id:
+                self.images[pub_image.name] = ImageState(
+                    content_id=new_content_id,
+                    mtime_ns=pub_image.mtime_ns,
+                    matte=pub_image.matte_id,
+                )
+                self.id_map[new_content_id] = pub_image.name
+                uploaded += 1
+
+        LOGGER.info(f"{len(self.to_upload)} images {dry_run}uploaded to TV.")
+        self.to_upload.clear()
+
+        if not ARGS.dry_run:
+            self.save()
+
+        frame_art.set_rotation(self.tv_state["rotation"])
+
+        return deleted, uploaded
+
+
+def synchronize(token_file: Path, state_file: Path) -> None:
+    """Synchronize a directory of JPEG images to a Samsung Frame TV.
+
+    Args:
+        token_file (Path): Path to the token file containing the TV authentication token.
+        state_file (Path): Path to the state file containing the TV state.
+
+    Returns:
+        None
+    """
+
+    notify("FrameTVSync", f"Syncing images in {ARGS.directory} ...")
+
+    pub_images: dict[str, PubImage] = {
+        path.name: PubImage(path)
+        for path in sorted(ARGS.directory.iterdir())
         if path.is_file() and path.suffix.lower() in VALID_IMAGE_SUFFIXES
     }
-    local_names: set[str] = set(local_files)
-    uploaded = 0
-    deleted = 0
+    """Published images in the sync directory, keyed by filename."""
 
-    for name, image_path in local_files.items():
-        previous = state["images"].get(name)
-        mtime_ns = image_path.stat().st_mtime_ns
-        matte = read_matte_tag(image_path)
+    state: SyncState = SyncState(state_file)
+    frame_art: FrameArt = FrameArt(
+        token_file,
+        **state.tv_state,
+    )
+    sync_stats: SyncStats = state.discover_changes(pub_images, frame_art)
+    """Sync statistics."""
 
-        if (
-            previous
-            and previous.get("mtime_ns") == mtime_ns
-            and previous.get("matte") == matte
-            and previous.get("content_id")
-        ):
-            continue
+    to_be_added: int = sync_stats.added
+    """Count of images added to TV."""
+    to_be_modified: int = sync_stats.modified
+    """Count of images modified on TV."""
+    to_be_deleted: int = sync_stats.deleted + sync_stats.unknown
+    """Count of images deleted from TV."""
 
-        if dry_run:
-            LOGGER.info("DRY-RUN: would upload %s with matte=%s", name, matte)
-            uploaded += 1
-            continue
+    deleted, uploaded = state.commit_changes(frame_art)
+    upload_fail = to_be_added + to_be_modified - uploaded
+    delete_fail = to_be_deleted + to_be_modified - deleted
 
-        if tv is None:
-            raise RuntimeError("TV connection is required for a live sync")
+    if ARGS.dry_run:
+        stats: str = f"{to_be_added} images would be added, {to_be_modified} images would be modified, {to_be_deleted} images would be deleted."
+        dry_run: str = "DRY RUN "
+    else:
+        stats: str = f"{to_be_added} images added, {to_be_modified} images modified, {to_be_deleted} images deleted."
+        dry_run: str = ""
 
-        with image_path.open("rb") as handle:
-            data = handle.read()
-
-        LOGGER.info("Uploading %s with matte=%s ...", name, matte)
-        content_id = tv.upload(
-            data, file_type=file_type_for(image_path), matte=matte, portrait_matte=matte
+    if WARNINGS:
+        LOGGER.info(f"Sync {dry_run}completed with {WARNINGS} warning(s).")
+        if upload_fail > 0 or delete_fail > 0:
+            stats = f"{upload_fail} upload(s) failed, {delete_fail} deletion(s) failed."
+        notify(
+            "FrameTVSync", f"Sync {dry_run}completed with {WARNINGS} warning(s) -- see log\n{stats}"
         )
-        tv.set_favourite(content_id, status="on")
-        previous_content_id = previous.get("content_id") if previous else None
-        if previous_content_id and previous_content_id != content_id:
-            try:
-                tv.delete(previous_content_id)
-                deleted += 1
-                LOGGER.info("Deleted stale TV artwork %s for %s", previous_content_id, name)
-            except Exception as exc:
-                LOGGER.warning("Failed to delete stale artwork %s on the TV: %s", name, exc)
-        state["images"][name] = {
-            "mtime_ns": mtime_ns,
-            "matte": matte,
-            "content_id": content_id,
-        }
-        uploaded += 1
-        LOGGER.info("Uploaded %s -> %s (matte=%s)", name, content_id, matte)
 
-    for name in list(state["images"]):
-        if name not in local_names:
-            if dry_run:
-                LOGGER.info("DRY-RUN: would remove %s from TV", name)
-                deleted += 1
-            else:
-                stale_content_id = state["images"][name]["content_id"]
-                try:
-                    assert tv is not None
-                    tv.delete(stale_content_id)
-                except Exception as exc:
-                    LOGGER.warning("Failed to delete %s on the TV: %s", name, exc)
-                LOGGER.info("Removed state entry for %s", name)
-                deleted += 1
-            del state["images"][name]
+    else:
+        notify("FrameTVSync", f"Sync {dry_run}completed!\n{stats}")
 
-    return uploaded, deleted
+    LOGGER.info(stats)
+
+    if not ARGS.dry_run:
+        state.save()
 
 
-def cli(argv: list[str] | None = None) -> int:
+def main() -> None:
+    """Main entry point of the FrameTVSync script."""
+
+    global ARGS
+
     parser = argparse.ArgumentParser(description="Sync a directory of JPEGs to a Samsung Frame TV.")
     parser.add_argument("directory", type=Path, help="Directory containing JPEG images to sync")
     parser.add_argument("--ip", type=ip_address, help="Samsung Frame TV IP address")
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=DEFAULT_PORT,
-        help="Samsung Frame TV websocket port, default: %(default)d",
-    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -482,101 +960,48 @@ def cli(argv: list[str] | None = None) -> int:
         help="Suppress logging to the console (file logging remains enabled)",
     )
     parser.add_argument(
-        "-r",
         "--rotation",
         type=int,
-        help="Set the TV artwork rotation period in minutes (0 disables rotation)",
+        default=DEFAULT_ROTATION,
+        help="Set the TV artwork rotation period in minutes (0 disables rotation), default: %(default)d",
     )
     parser.add_argument(
-        "--reset",
+        "--watch",
         action="store_true",
-        help="Delete all non-Samsung Art Store images from the TV",
+        help="Watch the published folder for changes",
     )
-    args = parser.parse_args(argv)
+    ARGS = parser.parse_args(sys.argv[1:])
 
-    directory = Path(args.directory).expanduser().resolve()
+    directory: Path = Path(ARGS.directory).expanduser().resolve()
     if not directory.exists() or not directory.is_dir():
-        parser.error(f"Directory not found: {directory}")
+        parser.error(f"Directory not found: {directory}.")
+    ARGS.directory = directory
 
-    configure_logging(directory, quiet=args.quiet)
+    if ARGS.rotation < 0:
+        parser.error("Rotation interval must be zero or greater.")
 
-    token_file = directory / ".frametvsync.token"
-    LOGGER.info("SamsungTVWS token file: %s", token_file)
-    state_path = directory / ".frametvsync_state.json"
+    configure_logging(directory)
+    LOGGER.info(f"{'=' * 60}")
+    LOGGER.info(f"{SCRIPT_NAME} version {__version__} starting ...")
+    LOGGER.info(f"Command: {', '.join(sys.argv[1:])}")
 
-    if not state_path.exists() and not args.ip:
-        parser.error("A TV IP address is required on the first run. Pass --ip.")
+    token_file = directory / TOKEN_FILE
+    LOGGER.info(f"SamsungTVWS token file: {token_file}.")
+    state_file = directory / SYNC_STATE
+    LOGGER.info(f"Sync state file: {state_file}.")
 
-    state: State = load_state(state_path)
+    synchronize(token_file, state_file)
 
-    ip = str(args.ip) if args.ip else str(state["tv"].get("ip") or "").strip()
-    if not ip:
-        parser.error("A TV IP address is required. Pass --ip or set state.tv.ip.")
 
-    state["tv"]["ip"] = ip
-    state["tv"]["port"] = args.port
-    rotation = args.rotation if args.rotation is not None else state["tv"]["rotation"]
-    if rotation < 0:
-        parser.error("Rotation period must be zero or greater.")
-    state["tv"]["rotation"] = rotation
-
-    if args.dry_run and not args.reset:
-        LOGGER.info("Dry run enabled; no uploads will be sent to the TV.")
-        uploaded, deleted = sync_directory(None, directory, state, dry_run=True)
-        LOGGER.info(
-            f"Dry run complete: {uploaded} image(s) would be uploaded, {deleted} image(s) would be deleted from the TV."
-        )
-        return 0
-
-    tv = connect_tv(ip=ip, port=args.port, token_file=str(token_file))
-
+def cli() -> None:
+    """Command-line interface."""
     try:
-        if not args.dry_run:
-            LOGGER.info("Setting TV artwork rotation to %d minutes ...", rotation)
-            set_slideshow_status = getattr(tv, "set_slideshow_status", None)
-            rotation_set = False
-            if callable(set_slideshow_status):
-                try:
-                    set_slideshow_status(duration=rotation, category_id="MY-C0004")
-                    rotation_set = True
-                except ResponseError:
-                    LOGGER.info("TV rejected slideshow API; retrying legacy rotation API")
-                    try:
-                        tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
-                        rotation_set = True
-                    except ResponseError as exc:
-                        LOGGER.warning("TV rejected both artwork rotation APIs: %s", exc)
-            if not callable(set_slideshow_status):
-                try:
-                    tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
-                    rotation_set = True
-                except ResponseError as exc:
-                    LOGGER.warning("TV rejected the artwork rotation API: %s", exc)
-            if rotation_set:
-                LOGGER.info("TV artwork rotation set to %d minutes", rotation)
-        if args.reset:
-            deleted_ids: set[str] = reset_tv_art(tv, dry_run=args.dry_run)
-            if not args.dry_run:
-                state["images"] = {
-                    name: image
-                    for name, image in state["images"].items()
-                    if image.get("content_id") not in deleted_ids
-                }
-                save_state(state_path, state)
-            LOGGER.info(
-                f"Reset {'would remove' if args.dry_run else 'removed'} {len(deleted_ids)} image(s)"
-            )
-            return 0
+        main()
+        cleanup_and_exit(0)
 
-        uploaded, deleted = sync_directory(tv, directory, state, dry_run=False)
-        save_state(state_path, state)
-        LOGGER.info(f"Uploaded {uploaded} image(s) from {directory}")
-        LOGGER.info(f"Deleted {deleted} image(s) from TV")
-        return 0
-    finally:
-        save_state(state_path, state)
-        tv.close()
+    except Exception as e:  # noqa: BLE001
+        fatal_error(str(e))
 
 
 if __name__ == "__main__":
-    sys.exit(cli())
+    cli()
