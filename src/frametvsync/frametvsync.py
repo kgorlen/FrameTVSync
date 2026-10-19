@@ -1,4 +1,4 @@
-"""frametvsync: Sync a directory of JPEGs with a Samsung Frame TV.
+"""frametvsync: Synchronize JPEG images in a Lightroom Classic published folder to Samsung Frame TV Favorites.
 
 References:
     https://github.com/xchwarze/samsung-tv-ws-api
@@ -20,11 +20,15 @@ import os
 import platform
 import re
 import sys
+from collections.abc import Callable
+from functools import partial
 from ipaddress import ip_address
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from threading import Lock, Timer
 from time import sleep
-from typing import Any, NoReturn, TypedDict, cast
+from types import TracebackType
+from typing import Any, NoReturn, Self, TypedDict, cast
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 """Path to directory containing this Python script."""
@@ -36,6 +40,8 @@ from __init__ import __version__  # pylint: disable=no-name-in-module
 from PIL import Image
 from samsungtvws import SamsungTVArt
 from samsungtvws.exceptions import ConnectionFailure, ResponseError, UnauthorizedError
+from watchdog.events import FileSystemEvent, FileSystemEventHandler
+from watchdog.observers import Observer
 
 # pylint: enable=wrong-import-position
 
@@ -57,6 +63,8 @@ DEFAULT_ROTATION: int = 10
 """Default slideshow rotation interval in minutes."""
 TV_REQUEST_TIMEOUT: int = 10
 """Timeout for TV requests in seconds."""
+SYNC_DELAY_SECONDS: int = 30
+"""Seconds to wait after the last published image change before syncing."""
 SYNC_STATE: str = ".sync_state/.frametvsync_state.json"
 """Path to sync state file."""
 TOKEN_FILE: str = ".sync_state/.frametvsync.token"
@@ -92,20 +100,14 @@ def notify(title: str, message: str) -> None:
 
         win_notify(title, message)
 
+    # macOS
     elif system == "Darwin":
-        import subprocess
+        import pync
 
-        subprocess.run(
-            [
-                "osascript",
-                "-e",
-                f'display notification "{message}" with title "{title}"',
-            ],
-            check=True,
-        )
+        pync.notify(message, title=title)
 
     else:
-        raise RuntimeError(f"Unsupported platform: {system}")
+        LOGGER.info(f"Unsupported platform for notifications: {system}")
 
 
 def cleanup_and_exit(status: int = 0) -> NoReturn:
@@ -239,6 +241,10 @@ class PubImage(Path):
             bytes: The image file data as bytes.
         """
         return self.read_bytes()
+
+    def close(self) -> None:
+        """Close the underlying PIL image and its file handle."""
+        self.image.close()
 
     def size(self) -> tuple[int, int]:
         """Return the image size as a tuple (width, height).
@@ -430,7 +436,7 @@ class ImageState(TypedDict):
     """Published image matte from HierarchicalImage """
 
 
-class FrameArt:
+class FrameTV:
     """Samsung Frame TV."""
 
     def __init__(self, token_file: Path, ip: str, port: int, rotation: int) -> None:
@@ -477,6 +483,7 @@ class FrameArt:
                 timeout=TV_REQUEST_TIMEOUT,
             )
 
+            LOGGER.info("Open Samsung Frame TV ...")
             self.tv.open()
 
             if not self.tv.get_artmode():
@@ -506,6 +513,20 @@ class FrameArt:
                 "The TV rejected the connection. Approve the pairing request on the TV, then retry. "
                 f"If no prompt appears, delete {token_file} and retry."
             ) from exc
+
+    def __enter__(self) -> Self:
+        """Return this TV connection for use as a context manager."""
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        LOGGER.info("Closing Samsung TV connection ...""")
+        self.tv.close()
+        LOGGER.info("Samsung TV connection closed.")
 
     def supported_matte_id(self, pub_image: PubImage) -> str:
         """Convert matte ID to one supported by the TV.
@@ -539,13 +560,13 @@ class FrameArt:
             rotation (int): Slideshow rotation interval in minutes.
 
         Returns:
-            bool: True if rotation set succussfully.
+            bool: True if rotation interval set succussfully.
         """
 
         if ARGS.dry_run:
             return True
 
-        LOGGER.info(f"Setting TV artwork rotation to {rotation} minutes ...")
+        LOGGER.info(f"Setting TV artwork rotation interval to {rotation} minutes ...")
         set_slideshow_status = getattr(self.tv, "set_slideshow_status", None)
         if callable(set_slideshow_status):
             try:
@@ -565,7 +586,7 @@ class FrameArt:
                 warn_msg(f"TV rejected the artwork rotation API: {exc}.")
                 return False
 
-        LOGGER.info(f"TV artwork rotation set to {rotation} minutes.")
+        LOGGER.info(f"TV artwork rotation interval set to {rotation} minutes.")
         return True
 
     def download_art(self) -> dict[str, FrameImage]:
@@ -625,6 +646,8 @@ class FrameArt:
         except Exception as exc:  # noqa: BLE001
             warn_msg(f"Failed to upload TV artwork {pub_image.name}: {exc}")
             return ""
+        finally:
+            del image_data
 
         LOGGER.info(f"Uploaded {pub_image.name}.")
         sleep(2)
@@ -699,9 +722,7 @@ class SyncState:
             state_file (Path): Path to the JSON file storing the sync state.
         """
         self.pub_dir: Path = ARGS.directory
-        """Lightroom publish directory containing images to sync with the TV."""
-        self.pub_dir: Path = ARGS.directory
-        """Lightroom publish directory containing images to sync with the TV."""
+        """Lightroom publish folder containing images to sync with the TV."""
         self.state_file: Path = state_file
         """Path to the JSON file storing the sync state."""
         self.version: int = STATE_VERSION
@@ -763,7 +784,7 @@ class SyncState:
             file.write("\n")
         LOGGER.info(f"Sync state saved to {self.state_file}.")
 
-    def discover_changes(self, pub_images: dict[str, PubImage], frame_art: FrameArt) -> SyncStats:
+    def discover_changes(self, pub_images: dict[str, PubImage], frame_art: FrameTV) -> SyncStats:
         """Update the sync state and to_delete and to_upload lists.
 
         Args:
@@ -830,7 +851,7 @@ class SyncState:
 
         return SyncStats(unknown, missing, deleted, added, modified)
 
-    def commit_changes(self, frame_art: FrameArt) -> tuple[int, int]:
+    def commit_changes(self, frame_art: FrameTV) -> tuple[int, int]:
         """Commit art deletions and uploads to TV.
 
         Args:
@@ -878,7 +899,7 @@ class SyncState:
 
 
 def synchronize(token_file: Path, state_file: Path) -> None:
-    """Synchronize a directory of JPEG images to a Samsung Frame TV.
+    """Synchronize JPEG images in directory to Samsung Frame TV Favorites.
 
     Args:
         token_file (Path): Path to the token file containing the TV authentication token.
@@ -898,21 +919,23 @@ def synchronize(token_file: Path, state_file: Path) -> None:
     """Published images in the sync directory, keyed by filename."""
 
     state: SyncState = SyncState(state_file)
-    frame_art: FrameArt = FrameArt(
-        token_file,
-        **state.tv_state,
-    )
-    sync_stats: SyncStats = state.discover_changes(pub_images, frame_art)
-    """Sync statistics."""
 
-    to_be_added: int = sync_stats.added
-    """Count of images added to TV."""
-    to_be_modified: int = sync_stats.modified
-    """Count of images modified on TV."""
-    to_be_deleted: int = sync_stats.deleted + sync_stats.unknown
-    """Count of images deleted from TV."""
+    with FrameTV(token_file, **state.tv_state) as frame_tv:
+        sync_stats: SyncStats = state.discover_changes(pub_images, frame_tv)
+        """Sync statistics."""
 
-    deleted, uploaded = state.commit_changes(frame_art)
+        to_be_added: int = sync_stats.added
+        """Count of images added to TV."""
+        to_be_modified: int = sync_stats.modified
+        """Count of images modified on TV."""
+        to_be_deleted: int = sync_stats.deleted + sync_stats.unknown
+        """Count of images deleted from TV."""
+
+        deleted, uploaded = state.commit_changes(frame_tv)
+
+    for pub_image in pub_images.values():
+        pub_image.close()
+
     upload_fail = to_be_added + to_be_modified - uploaded
     delete_fail = to_be_deleted + to_be_modified - deleted
 
@@ -940,30 +963,123 @@ def synchronize(token_file: Path, state_file: Path) -> None:
         state.save()
 
 
+class SyncEventHandler(FileSystemEventHandler):
+    """Run synchronization when a published image changes."""
+
+    def __init__(self, sync_func: Callable[[], None]) -> None:
+        """Initialize the synchronization event handler.
+
+        Args:
+            sync_func (partial[Path, Path]): Function to call to perform synchronization.
+        """
+        super().__init__()
+        self._sync_func: Callable[[], None] = sync_func
+        """Function to call to perform synchronization."""
+        self._sync_timer: Timer | None = None
+        """Sync timer to delay synchronization after a file system event."""
+        self._timer_lock = Lock()
+        """Lock to protect access to the sync timer."""
+
+    def on_any_event(self, event: FileSystemEvent) -> None:
+        """Published folder event handler.
+
+        Args:
+            event (FileSystemEvent): Object containing information about the file system event.
+        """
+        if event.is_directory:
+            return
+
+        with self._timer_lock:
+            if self._sync_timer is None:
+                LOGGER.info(
+                    "Published folder change detected; waiting %d seconds to synchronize ...",
+                    SYNC_DELAY_SECONDS,
+                )
+            else:
+                self._sync_timer.cancel()
+
+            # Start/restart the sync timer
+            self._sync_timer = Timer(SYNC_DELAY_SECONDS, self._synchronize)
+            self._sync_timer.daemon = True
+            self._sync_timer.start()
+
+    def _synchronize(self) -> None:
+        """Synchronize the published folder after delay from the last change."""
+        with self._timer_lock:
+            self._sync_timer = None
+
+        LOGGER.info(
+            "No published folder changes detected for %d seconds; synchronizing ...",
+            SYNC_DELAY_SECONDS,
+        )
+        try:
+            self._sync_func()
+        except Exception as exc:  # noqa: BLE001
+            warn_msg(f"Synchronization failed after published folder change: {exc}")
+        finally:
+            LOGGER.info(f"Resume watching {ARGS.directory} ...")
+
+    def close(self) -> None:
+        """Cancel a pending synchronization."""
+        with self._timer_lock:
+            if self._sync_timer is not None:
+                self._sync_timer.cancel()
+                self._sync_timer = None
+
+
+def watch_directory(token_file: Path, state_file: Path) -> None:
+    """Watch the published folder and synchronize when images change.
+
+    Args:
+        token_file (Path): Path to the token file containing the TV authentication token.
+        state_file (Path): Path to the state file containing the TV state.
+
+    """
+
+    observer = Observer()
+    event_handler = SyncEventHandler(partial(synchronize, token_file, state_file))
+    observer.schedule(
+        event_handler, str(ARGS.directory), recursive=False
+    )
+    observer.start()
+    LOGGER.info(f"Watching {ARGS.directory} for published directory changes ...")
+
+    try:
+        while observer.is_alive():
+            observer.join(1)
+    except KeyboardInterrupt:
+        LOGGER.info("Stopping published folder watch ...")
+    finally:
+        observer.stop()
+        observer.join()
+        event_handler.close()
+
+
 def main() -> None:
     """Main entry point of the FrameTVSync script."""
 
     global ARGS
 
-    parser = argparse.ArgumentParser(description="Sync a directory of JPEGs to a Samsung Frame TV.")
+    parser = argparse.ArgumentParser(description="Sync JPEG images in a Lightroom Classic published folder to Samsung Frame TV Favorites.")
     parser.add_argument("directory", type=Path, help="Directory containing JPEG images to sync")
     parser.add_argument("--ip", type=ip_address, help="Samsung Frame TV IP address")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Display what would change without uploading anything",
+        help="Display what would change without uploading or deleting anything",
     )
     parser.add_argument(
         "-q",
         "--quiet",
-        action="store_true",
-        help="Suppress logging to the console (file logging remains enabled)",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Disable console logging (file logging remains enabled)",
     )
     parser.add_argument(
         "--rotation",
         type=int,
         default=DEFAULT_ROTATION,
-        help="Set the TV artwork rotation period in minutes (0 disables rotation), default: %(default)d",
+        help="Slideshow rotation interval in minutes (0 disables rotation), default: %(default)d",
     )
     parser.add_argument(
         "--watch",
@@ -971,6 +1087,8 @@ def main() -> None:
         help="Watch the published folder for changes",
     )
     ARGS = parser.parse_args(sys.argv[1:])
+    if ARGS.watch and ARGS.quiet is None:
+        ARGS.quiet = True
 
     directory: Path = Path(ARGS.directory).expanduser().resolve()
     if not directory.exists() or not directory.is_dir():
@@ -991,6 +1109,8 @@ def main() -> None:
     LOGGER.info(f"Sync state file: {state_file}.")
 
     synchronize(token_file, state_file)
+    if ARGS.watch:
+        watch_directory(token_file, state_file)
 
 
 def cli() -> None:
