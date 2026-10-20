@@ -20,6 +20,7 @@ import os
 import platform
 import re
 import sys
+import warnings
 from collections.abc import Callable
 from functools import partial
 from ipaddress import ip_address
@@ -38,7 +39,7 @@ sys.path.append(str(SCRIPT_DIR))
 # pylint: disable=wrong-import-position
 from __init__ import __version__  # pylint: disable=no-name-in-module
 from PIL import Image
-from samsungtvws import SamsungTVArt
+from samsungtvws import SamsungTVArt, SamsungTVWS
 from samsungtvws.exceptions import ConnectionFailure, ResponseError, UnauthorizedError
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -86,12 +87,12 @@ WARNINGS: int = 0
 """Warning message count."""
 
 
-def notify(title: str, message: str) -> None:
+def notify(message: str, title: str="FrameTVSync") -> None:
     """Post notification.
 
     Args:
-        title (str): Title of the notification.
         message (str): Message to display in the notification.
+        title (str): Title of the notification.
     """
     system: str = platform.system()
 
@@ -140,7 +141,7 @@ def fatal_error(msg: str) -> NoReturn:
         msg (str): Error message to display.
     """
     LOGGER.critical(f"{msg}; exiting.")
-    notify("FrameTVSync", msg)
+    notify(msg)
     cleanup_and_exit(1)
 
 
@@ -453,7 +454,9 @@ class FrameTV:
         """Supported matte types and colors downloaded from TV."""
         self.frame_art: dict[str, FrameImage] = {}
         """Frame images currently available on the TV, keyed by content_id."""
-        self.tv: SamsungTVArt
+        self.tv: SamsungTVWS
+        """SamsungTVWS object for TV connection."""
+        self.tv_art: SamsungTVArt
         """SamsungTVArt object"""
         self.deleted_art: set[str] = set()
         """content_ids of deleted art."""
@@ -474,8 +477,15 @@ class FrameTV:
         else:
             LOGGER.info(f"No auth token file found at {token_file}.")
 
+        warnings.filterwarnings(
+            "ignore",
+            message=rf"Unverified HTTPS request is being made to host '{re.escape(ip)}'",
+            category=Warning,
+            module=r"urllib3\.connectionpool",
+        )
+
         try:
-            self.tv = SamsungTVArt(
+            self.tv = SamsungTVWS(
                 host=ip,
                 port=port,
                 token_file=str(token_file),
@@ -483,16 +493,19 @@ class FrameTV:
                 timeout=TV_REQUEST_TIMEOUT,
             )
 
-            LOGGER.info("Open Samsung Frame TV ...")
-            self.tv.open()
+            self.tv_art = self.tv.art()
 
-            if not self.tv.get_artmode():
+            LOGGER.info("Checking art mode support ...")
+            if not self.tv_art.supported():
+                fatal_error("Art mode not supported")
+
+            LOGGER.info(f"Frame TV API version {self.tv_art.get_api_version()}")
+
+            if not self.tv_art.get_artmode():
                 LOGGER.info("Switching to art mode ...")
-                self.tv.set_artmode(True)
+                self.tv_art.set_artmode(True)
 
-            self.download_art()
-
-            matte_ids: list[dict[str, str]] = self.tv.get_matte_list()["matte_types"]
+            matte_ids: list[dict[str, str]] = self.tv_art.get_matte_list()["matte_types"]
             self.matte_ids = {matte_id["matte_id"].strip().lower() for matte_id in matte_ids}
             self.matte_ids.add("none_none")
             LOGGER.info(f"Supported matte ids: {', '.join(sorted(self.matte_ids))}")
@@ -501,6 +514,8 @@ class FrameTV:
                 fatal_error(
                     f"Default matte id {DEFAULT_MATTE_TYPE}_{DEFAULT_MATTE_COLOR} not supported by TV."
                 )
+
+            self.download_art()
 
             token = token_file.read_text(encoding="utf-8").strip() if token_file.exists() else ""
             if not token:
@@ -524,7 +539,7 @@ class FrameTV:
         exc_value: BaseException | None,
         traceback: TracebackType | None,
     ) -> None:
-        LOGGER.info("Closing Samsung TV connection ...""")
+        LOGGER.info("Closing Samsung TV connection ...")
         self.tv.close()
         LOGGER.info("Samsung TV connection closed.")
 
@@ -567,21 +582,21 @@ class FrameTV:
             return True
 
         LOGGER.info(f"Setting TV artwork rotation interval to {rotation} minutes ...")
-        set_slideshow_status = getattr(self.tv, "set_slideshow_status", None)
+        set_slideshow_status = getattr(self.tv_art, "set_slideshow_status", None)
         if callable(set_slideshow_status):
             try:
                 set_slideshow_status(duration=rotation, category_id="MY-C0004")
             except ResponseError:
                 LOGGER.info("TV rejected slideshow API; trying legacy rotation API ...")
                 try:
-                    self.tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
+                    self.tv_art.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
                 except ResponseError as exc:
                     warn_msg(f"TV rejected both artwork rotation APIs: {exc}.")
                     return False
 
         else:
             try:
-                self.tv.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
+                self.tv_art.set_auto_rotation_status(duration=rotation, category_id="MY-C0004")
             except ResponseError as exc:
                 warn_msg(f"TV rejected the artwork rotation API: {exc}.")
                 return False
@@ -596,7 +611,7 @@ class FrameTV:
             dict[str, FrameImage]: Dictionary of FrameImage objects keyed by content_id.
         """
         LOGGER.info("Downloading Samsung Frame TV artwork information ...")
-        tv_images = self.tv.available()
+        tv_images = self.tv_art.available()
         self.frame_art = {
             image["content_id"]: FrameImage(**image)
             for image in tv_images
@@ -636,7 +651,7 @@ class FrameTV:
 
             LOGGER.info(f"Uploading {pub_image.name} with matte={supported_matte_id} ...")
 
-            content_id: str = self.tv.upload(
+            content_id: str = self.tv_art.upload(
                 image_data,
                 file_type="PNG" if pub_image.suffix.lower() == ".png" else "JPEG",
                 matte=supported_matte_id,
@@ -653,7 +668,7 @@ class FrameTV:
         sleep(2)
         LOGGER.info(f"{pub_image.name} uploaded, content_id {content_id}.")
         LOGGER.info(f"Setting {pub_image.name} as favorite ...")
-        self.tv.set_favourite(content_id, status="on")
+        self.tv_art.set_favourite(content_id, status="on")
         LOGGER.info(f"{pub_image.name} set as favorite.")
         return content_id
 
@@ -681,7 +696,7 @@ class FrameTV:
 
         LOGGER.info(f"Deleting TV artwork {content_id}{art_name} ...")
         try:
-            self.tv.delete(content_id)
+            self.tv_art.delete(content_id)
             LOGGER.info(f"Deleted TV artwork {content_id}{art_name}.")
             sleep(2)
         except Exception as exc:  # pragma: no cover - runtime interaction  # noqa: BLE001
@@ -909,7 +924,7 @@ def synchronize(token_file: Path, state_file: Path) -> None:
         None
     """
 
-    notify("FrameTVSync", f"Syncing images in {ARGS.directory} ...")
+    notify(f"Syncing images in {ARGS.directory} ...")
 
     pub_images: dict[str, PubImage] = {
         path.name: PubImage(path)
@@ -950,12 +965,10 @@ def synchronize(token_file: Path, state_file: Path) -> None:
         LOGGER.info(f"Sync {dry_run}completed with {WARNINGS} warning(s).")
         if upload_fail > 0 or delete_fail > 0:
             stats = f"{upload_fail} upload(s) failed, {delete_fail} deletion(s) failed."
-        notify(
-            "FrameTVSync", f"Sync {dry_run}completed with {WARNINGS} warning(s) -- see log\n{stats}"
-        )
+        notify(f"Sync {dry_run}completed with {WARNINGS} warning(s) -- see log\n{stats}")
 
     else:
-        notify("FrameTVSync", f"Sync {dry_run}completed!\n{stats}")
+        notify(f"Sync {dry_run}completed!\n{stats}")
 
     LOGGER.info(stats)
 
@@ -1014,8 +1027,15 @@ class SyncEventHandler(FileSystemEventHandler):
         )
         try:
             self._sync_func()
-        except Exception as exc:  # noqa: BLE001
-            warn_msg(f"Synchronization failed after published folder change: {exc}")
+        except ConnectionFailure as e:
+            warn_msg(f"Connection failure: {e}, changes may not have been synchronized.")
+            notify("Connection failure, changes may not have been synchronized.")
+        except ResponseError as e:
+            fatal_error(f"API error: {e}, changes may not have been synchronized")
+        except Exception as e:  # noqa: BLE001
+            fatal_error(
+                f"Synchronization failed after published folder change: {e}, changes may not have been synchronized"
+            )
         finally:
             LOGGER.info(f"Resume watching {ARGS.directory} ...")
 
@@ -1038,9 +1058,7 @@ def watch_directory(token_file: Path, state_file: Path) -> None:
 
     observer = Observer()
     event_handler = SyncEventHandler(partial(synchronize, token_file, state_file))
-    observer.schedule(
-        event_handler, str(ARGS.directory), recursive=False
-    )
+    observer.schedule(event_handler, str(ARGS.directory), recursive=False)
     observer.start()
     LOGGER.info(f"Watching {ARGS.directory} for published directory changes ...")
 
@@ -1060,7 +1078,9 @@ def main() -> None:
 
     global ARGS
 
-    parser = argparse.ArgumentParser(description="Sync JPEG images in a Lightroom Classic published folder to Samsung Frame TV Favorites.")
+    parser = argparse.ArgumentParser(
+        description="Sync JPEG images in a Lightroom Classic published folder to Samsung Frame TV Favorites."
+    )
     parser.add_argument("directory", type=Path, help="Directory containing JPEG images to sync")
     parser.add_argument("--ip", type=ip_address, help="Samsung Frame TV IP address")
     parser.add_argument(

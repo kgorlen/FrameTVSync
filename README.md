@@ -228,7 +228,7 @@ To reauthorize **frametvsync** to access the TV:
 
 1. Go to `Settings → General → External Device Manager → Device Connection Manager → Device List` and delete the PC (Smart Device).
 1. Delete the token file `.sync_state\.framesync.token` in the published folder.
-1. With the TV in Art Mode, run `frametvsync`.  The TV should prompt to allow access.
+1. With the TV in Art Mode, run `frametvsync`.  The TV should prompt to allow the connection.
 
 ### Missing or wrong matte styling
 
@@ -245,7 +245,7 @@ This project is distributed under the GNU GPL-3.0-or-later license. See `LICENSE
 
 ## See Also
 
-- [*Samsung Smart TV WS API wrapper* by xschwarze](https://github.com/xchwarze/samsung-tv-ws-api)
+- [*Samsung Smart TV WS API wrapper* by xchwarze](https://github.com/xchwarze/samsung-tv-ws-api)
 - [*Samsung Smart TV WS API wrapper* fork by Nick Waterton (not used for this project)](https://github.com/NickWaterton/samsung-tv-ws-api)
 - [*The Samsung Frame: Best when Scripted* by Jon Scully](https://jonsully.net/blog/samsung-frame-art-api)
 - [*Part 1: Uploading Photos from Lightroom to a Samsung Frame TV*, Dashed Yellow Line](https://dashedyellowline.com/2024/06/07/samsung-frame-tv-lightroom)
