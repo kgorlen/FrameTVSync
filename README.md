@@ -202,7 +202,7 @@ The Lightroom Classic Print Module can be used to create custom mattes and color
 
 Custom mattes fill the Frame, should have a 16:9 aspect ratio, and be tagged with the `Matte → Custom` keyword.
 
-Sample Lightroom Classic templates for the 55 in. Frame TV are available in the `lrtemplates` folder in the [GitHub FrameTVSync repository](https://github.com/kgorlen/FrameTVSync/tree/main/lrtimeplates).
+Sample Lightroom Classic templates for the 55 in. Frame TV are available in the `lrtemplates` folder in the [GitHub FrameTVSync repository](https://github.com/kgorlen/FrameTVSync/tree/main/lrtemplates).
 
 ## Authenticaton token, sync state, and log files
 
